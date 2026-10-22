@@ -1,0 +1,35 @@
+name: hermes-koyeb-sandbox
+version: 0.1.0
+description: Run Hermes terminal commands in a Koyeb Sandbox container. Registers the "koyeb" terminal backend.
+author: ThomsenDrake
+kind: backend
+requires_hermes: ">=0.21"
+license: MIT
+homepage: https://github.com/ThomsenDrake/hermes-koyeb-sandbox
+python_dependencies:
+  - "koyeb-sdk>=1.5.2,<2"
+requires_env:
+  - name: KOYEB_API_TOKEN
+    description: "Koyeb API token (create at https://app.koyeb.com/account/api)"
+    secret: true
+optional_env:
+  - name: KOYEB_SANDBOX_IMAGE
+    description: "Docker image for the sandbox (default koyeb/sandbox)"
+  - name: KOYEB_SANDBOX_REGION
+    description: "Koyeb region (default: SDK/account default)"
+  - name: KOYEB_SANDBOX_INSTANCE_TYPE
+    description: "micro | small | medium | large | xlarge (default micro)"
+  - name: KOYEB_SANDBOX_NAME_PREFIX
+    description: "Prefix for sandbox names (default hermes)"
+  - name: KOYEB_SANDBOX_TTL_SECONDS
+    description: "Auto-delete the sandbox after this many seconds (0 = never)"
+  - name: KOYEB_SANDBOX_IDLE_TIMEOUT_SECONDS
+    description: "Scale-to-zero idle timeout (0 = always-on)"
+  - name: KOYEB_SANDBOX_WAIT_READY_TIMEOUT_SECONDS
+    description: "Create/readiness timeout (default 300)"
+  - name: KOYEB_SANDBOX_REGISTRY_SECRET
+    description: "Koyeb secret with private-registry pull credentials"
+  - name: KOYEB_SANDBOX_BLOCK_NETWORK
+    description: "Set to true to block all sandbox egress"
+  - name: KOYEB_API_HOST
+    description: "Koyeb API host override (default https://app.koyeb.com)"
