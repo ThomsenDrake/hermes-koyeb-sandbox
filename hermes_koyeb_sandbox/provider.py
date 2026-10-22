@@ -33,7 +33,7 @@ class KoyebTerminalProvider(TerminalEnvironmentProvider):
 
     @property
     def default_cwd(self) -> str | None:
-        return "/workspace"
+        return "~"
 
     def _config(self) -> KoyebBackendConfig:
         return KoyebBackendConfig.from_env()

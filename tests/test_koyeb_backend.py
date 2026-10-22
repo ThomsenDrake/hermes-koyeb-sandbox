@@ -48,6 +48,15 @@ class FakeSandbox:
         self.calls.append({"command": "__delete__"})
 
 
+class _FakeFilesystem:
+    def __init__(self, sandbox):
+        self.sandbox = sandbox
+        self.writes: list[tuple[str, bytes]] = []
+
+    def write_file(self, path, content, encoding="utf-8"):
+        self.writes.append((path, content if isinstance(content, bytes) else content.encode()))
+
+
 class FakeSandboxModule(types.ModuleType):
     """koyeb module double: records constructor kwargs, returns FakeSandbox."""
 
@@ -74,16 +83,22 @@ class FakeSandboxModule(types.ModuleType):
                 self.name = name
                 self.api_token = api_token
                 self.calls = []
+                self.filesystem = _FakeFilesystem(self)
 
             def exec(self, command, cwd=None, env=None, timeout=30, **kwargs):
                 self.calls.append({"command": command, "cwd": cwd, "env": env, "timeout": timeout})
+                # Home probe: $HOME in the default koyeb/sandbox image (root).
+                if "${HOME:-/}" in command:
+                    return FakeCommandResult(stdout="/root\n", exit_code=0)
+                if command.startswith("test -d "):
+                    return FakeCommandResult(stdout="", exit_code=0)
                 # Behave like a shell: run the command, then the base's CWD-marker
                 # printf (the wrapper appends it to every command) with $(pwd -P)
                 # resolved to the exec cwd.
                 out = f"ran: {command}"
                 marker = re.search(r"(__HERMES_CWD_[0-9a-f]+__)", command)
                 if marker and "printf" in command:
-                    out += f"\n\n{marker.group(1)}{cwd}{marker.group(1)}\n"
+                    out += f"\n\n{marker.group(1)}{cwd or '/root'}{marker.group(1)}\n"
                 return FakeCommandResult(stdout=out, exit_code=0)
 
             def wait_ready(self, timeout=300):
@@ -264,15 +279,49 @@ def test_persistent_reuses_named_sandbox(fake_koyeb, monkeypatch):
         env.cleanup()
 
 
-def test_unusable_cwd_becomes_workspace(fake_koyeb, monkeypatch):
+def test_unusable_cwd_falls_back_to_home(fake_koyeb, monkeypatch):
     monkeypatch.setenv("KOYEB_API_TOKEN", "t")
     from hermes_koyeb_sandbox.environment import KoyebSandboxEnvironment
     cfg = KoyebBackendConfig.from_env()
-    # host-style cwd is not usable inside the remote container
+    # host-style cwd is not usable inside the remote container -> sandbox home
     env = KoyebSandboxEnvironment(cfg, cwd="/home/drake/project", timeout=60, task_id="t2",
                                   persistent=False)
     try:
-        assert env.cwd == "/workspace"
+        assert env.cwd == "/root"          # home probed from the fake sandbox
+        assert env._home == "/root"
+    finally:
+        env.cleanup()
+
+
+def test_exec_dispatched_without_cwd_kwarg(fake_koyeb, monkeypatch):
+    monkeypatch.setenv("KOYEB_API_TOKEN", "t")
+    from hermes_koyeb_sandbox.environment import KoyebSandboxEnvironment
+    cfg = KoyebBackendConfig.from_env()
+    env = KoyebSandboxEnvironment(cfg, cwd="~", timeout=60, task_id="t4", persistent=False)
+    try:
+        env.execute("echo hi")
+        sandbox = env._sandbox
+        # every exec call carries cwd=None: the wrapper owns `cd`
+        assert all(c["cwd"] is None for c in sandbox.calls)
+    finally:
+        env.cleanup()
+
+
+def test_execute_with_stdin_payload(fake_koyeb, monkeypatch):
+    monkeypatch.setenv("KOYEB_API_TOKEN", "t")
+    from hermes_koyeb_sandbox.environment import KoyebSandboxEnvironment
+    cfg = KoyebBackendConfig.from_env()
+    env = KoyebSandboxEnvironment(cfg, cwd="~", timeout=60, task_id="t5", persistent=False)
+    try:
+        result = env.execute("cat", stdin_data="payload-line-1\npayload-line-2\n")
+        # stdin was staged through sandbox.filesystem.write_file (SDK transport)
+        assert env._sandbox.filesystem.writes, "stdin was not staged"
+        path, data = env._sandbox.filesystem.writes[0]
+        assert path.startswith("/tmp/.hermes-stdin-")
+        assert data == b"payload-line-1\npayload-line-2\n"
+        # the dispatched command redirects stdin from the staged file
+        assert any("exec 0<" in c["command"] for c in env._sandbox.calls)
+        assert result["returncode"] == 0
     finally:
         env.cleanup()
 

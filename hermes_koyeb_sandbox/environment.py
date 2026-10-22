@@ -3,10 +3,17 @@
 One Koyeb Sandbox per task. Non-persistent: created on construction, deleted
 on cleanup. Persistent: named sandbox reused across sessions (resume by name;
 falls back to create when not found), left in place on cleanup.
+
+The Hermes command wrapper embeds its own ``builtin cd -- <cwd>`` and CWD
+marker, so commands are dispatched WITHOUT a cwd argument: the image's
+WORKDIR applies and the wrapper's cd positions the shell (a missing cwd then
+surfaces as the Hermes-standard exit 126 instead of a Koyeb API 400).
 """
 from __future__ import annotations
 
+import contextlib
 import logging
+import shlex
 import threading
 
 from tools.environments.base import BaseEnvironment
@@ -15,16 +22,17 @@ from .config import KoyebBackendConfig
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_CWD = "/workspace"
-_HOST_CWD_PREFIXES = ("/Users/", "/home/", "/opt/data/")
+_HOST_CWD_PREFIXES = ("/Users/", "/home/", "/opt/data/", "/mnt/", "/media/")
 
 
-def _sanitize_cwd(cwd: str | None) -> str:
-    """A host path is never usable inside the remote sandbox; map to /workspace."""
-    if not cwd or cwd == "~" or not cwd.startswith("/"):
-        return _DEFAULT_CWD
-    if cwd.startswith(_HOST_CWD_PREFIXES):
-        return _DEFAULT_CWD
+def _sanitize_cwd(cwd: str | None, home: str) -> str:
+    """Map ``~``, host-looking and relative cwds onto the sandbox home.
+
+    An absolute path that does not look like a host mount is kept; the
+    wrapper's ``cd`` surfaces a bad one as Hermes-standard exit 126.
+    """
+    if not cwd or cwd == "~" or not cwd.startswith("/") or cwd.startswith(_HOST_CWD_PREFIXES):
+        return home
     return cwd
 
 
@@ -40,9 +48,8 @@ class KoyebSandboxEnvironment(BaseEnvironment):
     _stdin_mode = "payload"
     _snapshot_timeout = 120
 
-    def __init__(self, config: KoyebBackendConfig, *, cwd: str = _DEFAULT_CWD,
-                 timeout: int = 120, task_id: str = "default", persistent: bool = False):
-        super().__init__(cwd=_sanitize_cwd(cwd), timeout=timeout)
+    def __init__(self, config: KoyebBackendConfig, *, cwd: str = "~", timeout: int = 120,
+                 task_id: str = "default", persistent: bool = False):
         self.config = config
         self.task_id = task_id
         self.persistent = persistent
@@ -50,6 +57,8 @@ class KoyebSandboxEnvironment(BaseEnvironment):
         self._lock = threading.RLock()
         self._closed = False
         self._sandbox = self._open_sandbox()
+        self._home = self._resolve_home()
+        super().__init__(cwd=_sanitize_cwd(cwd, self._home), timeout=timeout)
         try:
             self.init_session()
         except Exception:
@@ -98,6 +107,19 @@ class KoyebSandboxEnvironment(BaseEnvironment):
                     getattr(sandbox, "service_id", "?"), self.sandbox_name, self.task_id)
         return sandbox
 
+    def _resolve_home(self) -> str:
+        """The sandbox's own $HOME, probed once at open (image-dependent)."""
+        try:
+            result = self._sandbox.exec('echo "${HOME:-/}"', timeout=30)
+            home = (result.stdout or "").strip()
+            if result.exit_code == 0 and home.startswith("/") and home != "/":
+                probe = self._sandbox.exec(f"test -d {shlex.quote(home)}", timeout=30)
+                if probe.exit_code == 0:
+                    return home
+        except Exception as exc:
+            logger.warning("Koyeb: home probe failed: %s", exc)
+        return "/tmp"
+
     # ── BaseEnvironment contract ──────────────────────────────────────────
 
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
@@ -105,34 +127,53 @@ class KoyebSandboxEnvironment(BaseEnvironment):
         if self._closed:
             raise RuntimeError("Koyeb environment is closed")
         sandbox, lock = self._sandbox, self._lock
-        state = {"cancelled": False}
+        state = {"cancelled": False, "staged": None, "dispatched": False}
 
         def cancel():
             with lock:
                 state["cancelled"] = True
 
         def exec_fn() -> tuple[str, int]:
+            staged = None
             with lock:
                 if state["cancelled"]:
                     return ("", 130)
             command = cmd_string
             if stdin_data:
-                # Base hands stdin through as payload; deliver it via a staged
-                # file redirect inside the sandbox.
-                staged = f"/tmp/hermes-stdin-{id(state)}"
-                command = (
-                    f"base64 -d > {staged} <<'HERMES_EOF' && "
-                    f"{self._redirect_stdin_from_file(cmd_string, staged)}\n"
-                    f"{_b64(stdin_data)}\nHERMES_EOF"
-                )
+                # Payload-mode stdin: stage the bytes through the SDK's file
+                # write (like Daytona), then let the wrapper's redirect own it.
+                staged = self._staged_stdin_path()
+                try:
+                    sandbox.filesystem.write_file(
+                        staged, stdin_data.encode("utf-8", "surrogateescape"))
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        sandbox.exec(f"rm -f {shlex.quote(staged)}", timeout=30)
+                    raise
+                with lock:
+                    if state["cancelled"]:  # cancel() raced the upload
+                        with contextlib.suppress(Exception):
+                            sandbox.exec(f"rm -f {shlex.quote(staged)}", timeout=30)
+                        return ("", 130)
+                    state["staged"] = staged
+                command = self._redirect_stdin_from_file(cmd_string, staged)
+            # The Koyeb executor runs a command string under `sh` (dash), but the
+            # Hermes wrapper is bash (``builtin cd``, ``export -p``, ``declare``).
+            # Dispatch an explicit bash shell, as the Daytona backend does.
+            shell_cmd = f"bash {'-l ' if login else ''}-c {shlex.quote(command)}"
             try:
-                result = sandbox.exec(command, cwd=self.cwd, timeout=timeout)
+                result = sandbox.exec(shell_cmd, timeout=timeout)
             except Exception as exc:
+                if staged and not state["dispatched"]:
+                    with contextlib.suppress(Exception):
+                        sandbox.exec(f"rm -f {shlex.quote(staged)}", timeout=30)
                 if _sandbox_error_text(exc):
                     raise RuntimeError(
                         f"Koyeb sandbox {self.sandbox_name} is gone; recreate the environment"
                     ) from exc
                 raise
+            with lock:
+                state["dispatched"] = True
             # The base's ThreadedProcessHandle carries one stdout stream; the
             # Hermes terminal result is merged "output", so fold stderr in.
             out = result.stdout or ""
@@ -159,8 +200,3 @@ class KoyebSandboxEnvironment(BaseEnvironment):
             except Exception as exc:
                 if not _sandbox_error_text(exc):
                     logger.warning("Koyeb: cleanup failed: %s", exc)
-
-
-def _b64(data: str) -> str:
-    import base64
-    return base64.b64encode(data.encode("utf-8", "surrogateescape")).decode("ascii")
