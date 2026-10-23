@@ -18,7 +18,7 @@ prepended to ``sys.path`` only when ``koyeb`` is not already importable, so a
 normally-installed SDK (``pip install 'koyeb-sdk>=1.5.2,<2'``) always wins.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 import sys
 from pathlib import Path
