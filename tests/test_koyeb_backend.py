@@ -52,9 +52,19 @@ class _FakeFilesystem:
     def __init__(self, sandbox):
         self.sandbox = sandbox
         self.writes: list[tuple[str, bytes]] = []
+        self.uploads: list[tuple[str, str]] = []
 
     def write_file(self, path, content, encoding="utf-8"):
         self.writes.append((path, content if isinstance(content, bytes) else content.encode()))
+
+    def upload_file(self, local_path, remote_path, encoding="utf-8"):
+        self.uploads.append((local_path, remote_path))
+
+    def download_file(self, remote_path, local_path, encoding="utf-8"):
+        # Empty tar: sync_back extracts nothing and does not retry.
+        import tarfile
+        with tarfile.open(local_path, "w"):
+            pass
 
 
 class FakeSandboxModule(types.ModuleType):
@@ -70,6 +80,8 @@ class FakeSandboxModule(types.ModuleType):
         self.create_kwargs: list = []
         self.get_ids: list = []
         self.list_names: list[str] = []   # names Sandbox.list() reports as existing
+        self.created: list = []
+        self.events: list = []
 
     def _sandbox_cls(self):
         mod = self
@@ -111,11 +123,20 @@ class FakeSandboxModule(types.ModuleType):
 
             def delete(self):
                 self.calls.append({"command": "__delete__"})
+                mod.events.append(("delete", self.name))
+
+            def snapshot(self, name, wait_available=True, timeout=600, **kwargs):
+                self.calls.append({"command": "__snapshot__", "name": name})
+                mod.events.append(("snapshot", name))
+                return type("Snap", (), {"id": f"snap-{name}"})()
 
             @classmethod
             def create(cls, **kwargs):
                 mod.create_kwargs.append(kwargs)
-                return cls(name=kwargs.get("name"))
+                mod.events.append(("create", kwargs.get("name")))
+                inst = cls(name=kwargs.get("name"))
+                mod.created.append(inst)
+                return inst
 
             @classmethod
             def get_from_id(cls, id=None, api_token=None, host=None, **kwargs):
@@ -133,6 +154,10 @@ class FakeSandboxModule(types.ModuleType):
 def fake_koyeb(monkeypatch):
     mod = FakeSandboxModule()
     monkeypatch.setitem(sys.modules, "koyeb", mod)
+    # Don't upload the real Hermes tree during unit tests.
+    monkeypatch.setattr(
+        "tools.environments.file_sync.iter_sync_files", lambda *args, **kwargs: [],
+    )
     return mod
 
 
@@ -152,15 +177,20 @@ def test_config_requires_token(monkeypatch):
 
 
 def test_config_defaults(monkeypatch):
-    monkeypatch.setenv("KOYEB_API_TOKEN", "t")
+    token = "koyeb-test-token-do-not-log"
+    monkeypatch.setenv("KOYEB_API_TOKEN", token)
     cfg = KoyebBackendConfig.from_env()
-    assert cfg.api_token == "t"
+    assert cfg.api_token == token
+    assert token not in repr(cfg)
     assert cfg.image == "koyeb/sandbox"
     assert cfg.region is None          # SDK default (reads KOYEB_REGION itself)
-    assert cfg.instance_type == "micro"
+    assert cfg.instance_type is None   # derived
+    assert cfg.resolved_instance_type() == "micro"
     assert cfg.name_prefix == "hermes"
-    assert cfg.ttl_seconds == 0        # 0 = never auto-delete on TTL
-    assert cfg.idle_timeout == 0      # 0 = keep always-on
+    assert cfg.ttl_seconds == 0        # 0 = no delete_after_delay
+    assert cfg.idle_timeout is None    # derived from lifetime
+    assert cfg.resolved_idle_timeout() == max(600, 2 * cfg.lifetime_seconds)
+    assert cfg.resolved_delete_after_inactivity() == 3600
     assert cfg.wait_ready_timeout == 300
     assert cfg.registry_secret is None
     assert cfg.block_network is False
@@ -218,6 +248,11 @@ def test_execute_runs_command_through_koyeb(fake_koyeb, monkeypatch, tmp_path):
         assert kwargs["api_token"] == "t"
         assert kwargs["name"].startswith("hermes-")
         assert kwargs["image"] == "koyeb/sandbox"
+        assert kwargs["instance_type"] == "micro"
+        # Crash backstop: a sandbox Hermes never cleans up still stops billing.
+        assert kwargs["idle_timeout"] == cfg.resolved_idle_timeout()
+        assert kwargs["idle_timeout"] > 0
+        assert kwargs["delete_after_inactivity_delay"] == cfg.resolved_delete_after_inactivity()
     finally:
         env.cleanup()
 
@@ -347,9 +382,13 @@ def _load_plugin_root():
 class _FakeCtx:
     def __init__(self):
         self.registered = {}
+        self.tools = []
 
     def register_terminal_environment_provider(self, provider):
         self.registered["provider"] = provider
+
+    def register_tool(self, *args, **kwargs):
+        self.tools.append((args, kwargs))
 
 
 def test_provider_registers_koyeb_backend(fake_koyeb, monkeypatch):
@@ -365,6 +404,9 @@ def test_provider_registers_koyeb_backend(fake_koyeb, monkeypatch):
     assert provider.is_remote is True
     assert provider.is_container is True
     assert "KOYEB_API_TOKEN" in provider.strip_env_keys
+    assert provider.session_isolated_when_nonpersistent is True
+    assert provider.cache_path_base == "~/.hermes"
+    assert ctx.tools == []  # no model-facing tool; backends are terminal.backend only
 
 
 def test_provider_is_available_with_token(monkeypatch):
@@ -394,5 +436,197 @@ def test_provider_create_environment_builds_env(fake_koyeb, monkeypatch):
     try:
         assert type(env).__name__ == "KoyebSandboxEnvironment"
         assert env.task_id == "t3"
+        assert env._persistent is False
     finally:
         env.cleanup()
+
+
+def test_per_task_image_and_memory_select_instance(fake_koyeb, monkeypatch):
+    monkeypatch.setenv("KOYEB_API_TOKEN", "t")
+    monkeypatch.setenv("KOYEB_SANDBOX_IMAGE", "should-lose")
+    root = _load_plugin_root()
+    ctx = _FakeCtx()
+    root.register(ctx)
+    env = ctx.registered["provider"].create_environment(
+        cwd="/workspace", timeout=60, task_id="img",
+        image="python:3.12",
+        container_config={"container_persistent": False, "container_memory": 1024},
+    )
+    try:
+        kwargs = fake_koyeb.create_kwargs[-1]
+        assert kwargs["image"] == "python:3.12"
+        assert kwargs["instance_type"] == "small"  # 1 vCPU, 1 GiB covers 1024 MB
+    finally:
+        env.cleanup()
+
+
+def test_config_yaml_image_beats_legacy_env(monkeypatch):
+    monkeypatch.setenv("KOYEB_API_TOKEN", "t")
+    monkeypatch.setenv("KOYEB_SANDBOX_IMAGE", "from-env:latest")
+    monkeypatch.setattr(
+        "hermes_koyeb_sandbox.config._terminal_section",
+        lambda: {"koyeb_image": "from-config:latest"},
+    )
+    cfg = KoyebBackendConfig.from_env()
+    assert cfg.image == "from-config:latest"
+
+
+def test_explicit_instance_type_beats_resource_mapping(monkeypatch):
+    monkeypatch.setenv("KOYEB_API_TOKEN", "t")
+    cfg = KoyebBackendConfig.from_env(container_memory=8192, container_cpu=8)
+    assert cfg.resolved_instance_type() == "xlarge"
+    monkeypatch.setenv("KOYEB_SANDBOX_INSTANCE_TYPE", "nano")
+    pinned = KoyebBackendConfig.from_env(container_memory=8192)
+    assert pinned.instance_type == "nano"
+    assert pinned.resolved_instance_type() == "nano"
+
+
+def test_custom_disk_larger_than_instance_is_rejected(monkeypatch):
+    monkeypatch.setenv("KOYEB_API_TOKEN", "t")
+    with pytest.raises(ValueError, match="container_disk"):
+        KoyebBackendConfig.from_env(container_disk=6000)  # micro disk is 5120 MB
+
+
+def test_docker_network_false_blocks_egress(monkeypatch):
+    monkeypatch.setenv("KOYEB_API_TOKEN", "t")
+    cfg = KoyebBackendConfig.from_env(docker_network=False)
+    assert cfg.block_network is True
+
+
+def test_explicit_idle_zero_stays_always_on(monkeypatch):
+    monkeypatch.setenv("KOYEB_API_TOKEN", "t")
+    monkeypatch.setenv("KOYEB_SANDBOX_IDLE_TIMEOUT_SECONDS", "0")
+    cfg = KoyebBackendConfig.from_env()
+    assert cfg.resolved_idle_timeout() == 0
+
+
+def test_ephemeral_deletes_leftover_before_create(fake_koyeb, monkeypatch):
+    monkeypatch.setenv("KOYEB_API_TOKEN", "t")
+    from hermes_koyeb_sandbox.environment import KoyebSandboxEnvironment
+    cfg = KoyebBackendConfig.from_env()
+    fake_koyeb.list_names = [cfg.sandbox_name("left")]
+    env = KoyebSandboxEnvironment(cfg, cwd="~", timeout=30, task_id="left", persistent=False)
+    try:
+        kinds = [kind for kind, _name in fake_koyeb.events]
+        assert kinds.index("delete") < kinds.index("create")
+    finally:
+        env.cleanup()
+
+
+def test_persistent_snapshots_then_deletes(fake_koyeb, monkeypatch, tmp_path):
+    monkeypatch.setenv("KOYEB_API_TOKEN", "secret-token")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_koyeb_sandbox.environment import KoyebSandboxEnvironment, _load_snapshot_id
+    cfg = KoyebBackendConfig.from_env()
+    env = KoyebSandboxEnvironment(cfg, cwd="~", timeout=30, task_id="keep", persistent=True)
+    sandbox = env._sandbox
+    env.cleanup()
+    assert any(c.get("command") == "__snapshot__" for c in sandbox.calls)
+    assert any(c.get("command") == "__delete__" for c in sandbox.calls)
+    stored = _load_snapshot_id("keep")
+    assert stored and stored.startswith("snap-")
+    assert "secret-token" not in (tmp_path / "koyeb_snapshots.json").read_text()
+
+    # Next session restores that snapshot instead of an empty sandbox.
+    fake_koyeb.list_names = []
+    fake_koyeb.create_kwargs.clear()
+    restored = KoyebSandboxEnvironment(cfg, cwd="~", timeout=30, task_id="keep", persistent=True)
+    try:
+        assert fake_koyeb.create_kwargs[-1]["snapshot"] == stored
+    finally:
+        restored.cleanup()
+
+
+def test_init_failure_deletes_sandbox(fake_koyeb, monkeypatch):
+    monkeypatch.setenv("KOYEB_API_TOKEN", "t")
+    from hermes_koyeb_sandbox.environment import KoyebSandboxEnvironment
+
+    def boom(self):
+        raise RuntimeError("bootstrap failed")
+
+    monkeypatch.setattr(KoyebSandboxEnvironment, "init_session", boom)
+    cfg = KoyebBackendConfig.from_env()
+    with pytest.raises(RuntimeError, match="bootstrap failed"):
+        KoyebSandboxEnvironment(cfg, cwd="~", timeout=30, task_id="boom", persistent=False)
+    assert fake_koyeb.created, "sandbox was never created"
+    assert any(c.get("command") == "__delete__" for c in fake_koyeb.created[-1].calls)
+
+
+def test_cleanup_after_exec_exception_deletes(fake_koyeb, monkeypatch):
+    monkeypatch.setenv("KOYEB_API_TOKEN", "t")
+    from hermes_koyeb_sandbox.environment import KoyebSandboxEnvironment
+    cfg = KoyebBackendConfig.from_env()
+    env = KoyebSandboxEnvironment(cfg, cwd="~", timeout=30, task_id="err", persistent=False)
+    sandbox = env._sandbox
+
+    def explode(command, **kwargs):
+        raise TimeoutError("exec timed out")
+
+    sandbox.exec = explode
+    try:
+        env.execute("sleep 30")
+    except Exception:
+        pass
+    # A failed command does not delete the sandbox by itself (same as Modal/Docker).
+    assert not any(c.get("command") == "__delete__" for c in sandbox.calls)
+    env.cleanup()
+    assert any(c.get("command") == "__delete__" for c in sandbox.calls)
+
+
+def test_environment_returns_full_output_for_hermes_truncation(fake_koyeb, monkeypatch):
+    """Backends do not cap output. Hermes truncates in tool_output_truncate."""
+    monkeypatch.setenv("KOYEB_API_TOKEN", "t")
+    from hermes_koyeb_sandbox.environment import KoyebSandboxEnvironment
+    cfg = KoyebBackendConfig.from_env()
+    env = KoyebSandboxEnvironment(cfg, cwd="~", timeout=30, task_id="big", persistent=False)
+    blob = "x" * 20000
+    try:
+        env._sandbox.exec = lambda command, **kwargs: FakeCommandResult(
+            stdout=blob, stderr="tail", exit_code=0,
+        )
+        result = env.execute("echo big")
+        assert result["returncode"] == 0
+        assert blob in result["output"]
+        assert "tail" in result["output"]
+    finally:
+        env.cleanup()
+
+
+def test_file_sync_uploads_before_execute(fake_koyeb, monkeypatch, tmp_path):
+    monkeypatch.setenv("KOYEB_API_TOKEN", "t")
+    host_file = tmp_path / "token.txt"
+    host_file.write_text("secret")
+    remote = "/root/.hermes/credentials/token.txt"
+    monkeypatch.setattr(
+        "tools.environments.file_sync.iter_sync_files",
+        lambda *args, **kwargs: [(str(host_file), remote)],
+    )
+    from hermes_koyeb_sandbox.environment import KoyebSandboxEnvironment
+    cfg = KoyebBackendConfig.from_env()
+    env = KoyebSandboxEnvironment(cfg, cwd="~", timeout=30, task_id="sync", persistent=False)
+    try:
+        # FileSyncManager copies into a temp dir, then uploads that copy.
+        # The remote path is the contract; the local path is the staging file.
+        assert remote in [dest for _, dest in env._sandbox.filesystem.uploads]
+    finally:
+        env._sync_manager.sync_back = lambda *a, **k: None
+        env.cleanup()
+
+
+def test_probe_only_skips_file_sync(fake_koyeb, monkeypatch):
+    monkeypatch.setenv("KOYEB_API_TOKEN", "t")
+    root = _load_plugin_root()
+    ctx = _FakeCtx()
+    root.register(ctx)
+    env = ctx.registered["provider"].create_environment(
+        cwd="~", timeout=30, task_id="prompt-backend-probe",
+        container_config={"container_persistent": True},
+        probe_only=True,
+    )
+    try:
+        assert env.probe_only is True
+        assert env._persistent is False
+        assert env._sync_manager is None
+    finally:
+        env.cleanup()
+        assert any(c.get("command") == "__delete__" for c in env._sandbox.calls)
