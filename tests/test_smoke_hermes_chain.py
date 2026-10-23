@@ -52,6 +52,14 @@ class _RecordingSandbox:
 
     def exec(self, command, cwd=None, env=None, timeout=30, **kwargs):
         self.execs.append(command)
+        if "tar cf -" in command and "| base64" in command:
+            import base64
+            # Valid empty archive so sync_back does not retry on a fake stdout.
+            return CommandResult(
+                stdout=base64.b64encode(b"\0" * 1024).decode("ascii"),
+                stderr="tar: socket ignored\n",
+                exit_code=0,
+            )
         out = f"[koyeb-exec] {command}"
         marker = re.search(r"(__HERMES_CWD_[0-9a-f]+__)", command)
         if marker and "printf" in command:

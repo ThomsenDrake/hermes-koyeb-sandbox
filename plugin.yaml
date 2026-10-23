@@ -1,5 +1,5 @@
 name: hermes-koyeb-sandbox
-version: 0.2.0
+version: 0.2.1
 description: >
   Koyeb Sandbox terminal backend for Hermes Agent. With terminal.backend set
   to koyeb, the terminal, file tools, and execute_code run in a Koyeb Sandbox
