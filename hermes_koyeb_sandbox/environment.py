@@ -1,28 +1,47 @@
 """Koyeb sandbox execution environment (Hermes BaseEnvironment backend).
 
-One Koyeb Sandbox per task. Non-persistent: created on construction, deleted
-on cleanup. Persistent: named sandbox reused across sessions (resume by name;
-falls back to create when not found), left in place on cleanup.
+One Koyeb sandbox per task, same lifecycle as Modal and Vercel Sandbox:
+
+* **Persistent** (``terminal.container_persistent: true``, the Hermes default):
+  resume a still-living sandbox by name (a crashed process may not have
+  cleaned up yet). Otherwise restore the filesystem snapshot recorded for
+  this task, or create a fresh sandbox. On cleanup, sync ``~/.hermes`` back,
+  snapshot the filesystem, delete the live sandbox so it stops billing, and
+  keep the snapshot id for the next session.
+* **Non-persistent**: create on first use, delete on cleanup. A leftover
+  sandbox with the same name (a crash before the last cleanup) is deleted
+  before create so ephemeral runs never reuse each other's filesystem.
+
+Both modes pass ``idle_timeout`` and ``delete_after_inactivity_delay`` so a
+sandbox Hermes never gets to clean up scales to zero and is then deleted.
 
 The Hermes command wrapper embeds its own ``builtin cd -- <cwd>`` and CWD
 marker, so commands are dispatched WITHOUT a cwd argument: the image's
 WORKDIR applies and the wrapper's cd positions the shell (a missing cwd then
 surfaces as the Hermes-standard exit 126 instead of a Koyeb API 400).
+
+Command output truncation is not done here. Hermes truncates terminal and
+``execute_code`` output in ``tools/tool_output_truncate.py`` for every backend.
 """
 from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import shlex
 import threading
+import time
+from pathlib import Path
 
-from tools.environments.base import BaseEnvironment
+from tools.environments.base import BaseEnvironment, _load_json_store, _update_json_store
 
 from .config import KoyebBackendConfig
 
 logger = logging.getLogger(__name__)
 
 _HOST_CWD_PREFIXES = ("/Users/", "/home/", "/opt/data/", "/mnt/", "/media/")
+_SNAPSHOT_STORE_NAME = "koyeb_snapshots.json"
+_FILESYSTEM_SNAPSHOT_TIMEOUT = 180
 
 
 def _sanitize_cwd(cwd: str | None, home: str) -> str:
@@ -42,6 +61,36 @@ def _sandbox_error_text(exc: Exception) -> bool:
     return "not found" in text or "no longer exist" in text
 
 
+def _snapshot_store() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / _SNAPSHOT_STORE_NAME
+    except Exception:
+        return Path.home() / ".hermes" / _SNAPSHOT_STORE_NAME
+
+
+def _load_snapshot_id(task_id: str) -> str | None:
+    snapshot_id = _load_json_store(_snapshot_store()).get(task_id)
+    return snapshot_id if isinstance(snapshot_id, str) and snapshot_id else None
+
+
+def _store_snapshot_id(task_id: str, snapshot_id: str) -> None:
+    def update(snapshots: dict) -> None:
+        snapshots[task_id] = snapshot_id
+
+    _update_json_store(_snapshot_store(), update)
+
+
+def _drop_snapshot_id(task_id: str, snapshot_id: str | None = None) -> None:
+    def update(snapshots: dict) -> None:
+        current = snapshots.get(task_id)
+        if current is not None and snapshot_id in (None, current):
+            snapshots.pop(task_id, None)
+
+    _update_json_store(_snapshot_store(), update)
+
+
 class KoyebSandboxEnvironment(BaseEnvironment):
     """Run terminal commands inside a Koyeb Sandbox."""
 
@@ -49,17 +98,28 @@ class KoyebSandboxEnvironment(BaseEnvironment):
     _snapshot_timeout = 120
 
     def __init__(self, config: KoyebBackendConfig, *, cwd: str = "~", timeout: int = 120,
-                 task_id: str = "default", persistent: bool = False):
+                 task_id: str = "default", persistent: bool = False, probe_only: bool = False):
         self.config = config
         self.task_id = task_id
-        self.persistent = persistent
+        # ``_persistent`` is what Hermes' ``is_persistent_env`` reads so the
+        # agent loop keeps the sandbox across turns (Daytona/Modal do the same).
+        self.probe_only = probe_only
+        self.persistent = bool(persistent) and not probe_only
+        self._persistent = self.persistent
         self.sandbox_name = config.sandbox_name(task_id)
         self._lock = threading.RLock()
         self._closed = False
-        self._sandbox = self._open_sandbox()
-        self._home = self._resolve_home()
-        super().__init__(cwd=_sanitize_cwd(cwd, self._home), timeout=timeout)
+        self._sandbox = None
+        self._sync_manager = None
+        self._home = "/tmp"
         try:
+            self._sandbox = self._open_sandbox()
+            self._home = self._resolve_home()
+            super().__init__(cwd=_sanitize_cwd(cwd, self._home), timeout=timeout)
+            if not self.probe_only:
+                self._wire_sync()
+                if self._sync_manager is not None:
+                    self._sync_manager.sync(force=True)
             self.init_session()
         except Exception:
             self.cleanup()
@@ -67,42 +127,88 @@ class KoyebSandboxEnvironment(BaseEnvironment):
 
     # ── Sandbox lifecycle ────────────────────────────────────────────────
 
+    def _create_kwargs(self, *, snapshot: str | None = None) -> dict:
+        cfg = self.config
+        kwargs = dict(
+            image=cfg.image,
+            name=self.sandbox_name,
+            wait_ready=True,
+            api_token=cfg.api_token,
+            timeout=cfg.wait_ready_timeout,
+            instance_type=cfg.resolved_instance_type(),
+            # Always set, including 0 (explicit always-on). A positive value
+            # is the crash backstop: the instance sleeps if Hermes dies.
+            idle_timeout=cfg.resolved_idle_timeout(),
+        )
+        inactivity = cfg.resolved_delete_after_inactivity()
+        if inactivity > 0:
+            kwargs["delete_after_inactivity_delay"] = inactivity
+        if cfg.ttl_seconds > 0:
+            kwargs["delete_after_delay"] = cfg.ttl_seconds
+        if cfg.region:
+            kwargs["region"] = cfg.region
+        if cfg.registry_secret:
+            kwargs["registry_secret"] = cfg.registry_secret
+        if cfg.block_network:
+            kwargs["block_network"] = True
+        if cfg.api_host:
+            kwargs["host"] = cfg.api_host
+        if snapshot:
+            kwargs["snapshot"] = snapshot
+        return kwargs
+
+    def _find_existing(self):
+        import koyeb
+
+        matches = [
+            s for s in koyeb.Sandbox.list(api_token=self.config.api_token, host=self.config.api_host)
+            if getattr(s, "name", None) == self.sandbox_name
+        ]
+        if not matches:
+            return None
+        return koyeb.Sandbox.get_from_id(
+            id=matches[0].id, api_token=self.config.api_token, host=self.config.api_host,
+        )
+
+    def _delete_quiet(self, sandbox) -> None:
+        try:
+            sandbox.delete()
+        except Exception as exc:
+            if not _sandbox_error_text(exc):
+                logger.warning("Koyeb: failed to delete sandbox %s: %s", self.sandbox_name, exc)
+            return
+        logger.info("Koyeb: deleted sandbox %s", self.sandbox_name)
+
     def _open_sandbox(self):
         import koyeb  # lazy: only required when this backend is selected
 
-        create_kwargs = dict(
-            image=self.config.image,
-            name=self.sandbox_name,
-            wait_ready=True,
-            api_token=self.config.api_token,
-            timeout=self.config.wait_ready_timeout,
-            instance_type=self.config.instance_type,
-        )
-        if self.config.region:
-            create_kwargs["region"] = self.config.region
-        if self.config.ttl_seconds > 0:
-            create_kwargs["delete_after_delay"] = self.config.ttl_seconds
-        if self.config.idle_timeout > 0:
-            create_kwargs["idle_timeout"] = self.config.idle_timeout
-        if self.config.registry_secret:
-            create_kwargs["registry_secret"] = self.config.registry_secret
-        if self.config.block_network:
-            create_kwargs["block_network"] = True
-        if self.config.api_host:
-            create_kwargs["host"] = self.config.api_host
-
         if self.persistent:
-            # Resume a persistent sandbox by service-name lookup; create on miss.
-            existing = [s for s in koyeb.Sandbox.list(api_token=self.config.api_token,
-                                                      host=self.config.api_host)
-                        if s.name == self.sandbox_name]
-            if existing:
-                sandbox = koyeb.Sandbox.get_from_id(id=existing[0].id,
-                                                    api_token=self.config.api_token,
-                                                    host=self.config.api_host)
-                logger.info("Koyeb: resumed sandbox %s for task %s", sandbox.service_id, self.task_id)
-                return sandbox
-        sandbox = koyeb.Sandbox.create(**create_kwargs)
+            existing = self._find_existing()
+            if existing is not None:
+                logger.info("Koyeb: resumed sandbox %s for task %s",
+                            getattr(existing, "service_id", "?"), self.task_id)
+                return existing
+            snapshot_id = _load_snapshot_id(self.task_id)
+            if snapshot_id:
+                try:
+                    sandbox = koyeb.Sandbox.create(**self._create_kwargs(snapshot=snapshot_id))
+                    logger.info("Koyeb: restored snapshot %s for task %s", snapshot_id, self.task_id)
+                    return sandbox
+                except Exception as exc:
+                    logger.warning(
+                        "Koyeb: failed to restore snapshot %s for task %s; creating a fresh sandbox: %s",
+                        snapshot_id, self.task_id, exc,
+                    )
+                    _drop_snapshot_id(self.task_id, snapshot_id)
+        else:
+            # Ephemeral runs must not attach to a sandbox a crashed process left behind.
+            existing = self._find_existing()
+            if existing is not None:
+                logger.info("Koyeb: deleting leftover sandbox %s before a fresh ephemeral create",
+                            self.sandbox_name)
+                self._delete_quiet(existing)
+
+        sandbox = koyeb.Sandbox.create(**self._create_kwargs())
         logger.info("Koyeb: created sandbox %s (name=%s, task=%s)",
                     getattr(sandbox, "service_id", "?"), self.sandbox_name, self.task_id)
         return sandbox
@@ -119,6 +225,97 @@ class KoyebSandboxEnvironment(BaseEnvironment):
         except Exception as exc:
             logger.warning("Koyeb: home probe failed: %s", exc)
         return "/tmp"
+
+    def _wire_sync(self) -> None:
+        """Sync ``~/.hermes`` the way Modal, Daytona, and Vercel Sandbox do.
+
+        Skills, credential files, and cache land in the sandbox before each
+        command; cleanup pulls changes back. A probe (``uname`` for the system
+        prompt) skips this — uploading the tree just to print the kernel is
+        what the SSH probe_only path refuses to do.
+        """
+        try:
+            from tools.environments.file_sync import (
+                FileSyncManager, iter_sync_files, quoted_mkdir_command, quoted_rm_command,
+                unique_parent_dirs,
+            )
+        except Exception:
+            logger.debug("Koyeb: file sync unavailable", exc_info=True)
+            return
+        self._quoted_mkdir = quoted_mkdir_command
+        self._quoted_rm = quoted_rm_command
+        self._unique_parents = unique_parent_dirs
+        remote_base = f"{self._home.rstrip('/')}/.hermes"
+        self._sync_manager = FileSyncManager(
+            get_files_fn=lambda: iter_sync_files(remote_base),
+            upload_fn=self._upload_one,
+            delete_fn=self._delete_remote,
+            bulk_upload_fn=self._bulk_upload,
+            bulk_download_fn=self._bulk_download,
+        )
+
+    def _filesystem(self):
+        return self._sandbox.filesystem
+
+    def _upload_one(self, host_path: str, remote_path: str) -> None:
+        self._bulk_upload([(host_path, remote_path)])
+
+    def _bulk_upload(self, files: list[tuple[str, str]]) -> None:
+        if not files:
+            return
+        parents = self._unique_parents(files)
+        if parents:
+            self._sandbox.exec(self._quoted_mkdir(parents), timeout=60)
+        fs = self._filesystem()
+        for host_path, remote_path in files:
+            # base64: credential files and skill trees are not all UTF-8.
+            fs.upload_file(host_path, remote_path, encoding="base64")
+
+    def _delete_remote(self, remote_paths: list[str]) -> None:
+        if remote_paths:
+            self._sandbox.exec(self._quoted_rm(remote_paths), timeout=30)
+
+    def _bulk_download(self, dest: Path) -> None:
+        rel = f"{self._home.rstrip('/')}/.hermes".lstrip("/")
+        remote_tar = f"/tmp/.hermes_sync.{os.getpid()}.tar"
+        self._sandbox.exec(
+            f"tar cf {shlex.quote(remote_tar)} --exclude='*.sock' -C / {shlex.quote(rel)}",
+            timeout=120,
+        )
+        try:
+            self._filesystem().download_file(remote_tar, str(dest), encoding="base64")
+        finally:
+            with contextlib.suppress(Exception):
+                self._sandbox.exec(f"rm -f {shlex.quote(remote_tar)}", timeout=30)
+
+    def _before_execute(self) -> None:
+        if self._sync_manager is not None:
+            self._sync_manager.sync()
+
+    def _snapshot_filesystem(self, sandbox) -> str | None:
+        name = f"{self.sandbox_name}-{int(time.time())}"[:64]
+        try:
+            snapshot = sandbox.snapshot(name, wait_available=True, timeout=_FILESYSTEM_SNAPSHOT_TIMEOUT)
+        except Exception as exc:
+            logger.warning("Koyeb: filesystem snapshot failed for %s: %s", self.sandbox_name, exc)
+            return None
+        snapshot_id = getattr(snapshot, "id", None)
+        if not isinstance(snapshot_id, str) or not snapshot_id:
+            logger.warning("Koyeb: snapshot for %s returned no id", self.sandbox_name)
+            return None
+        return snapshot_id
+
+    def _delete_snapshot_object(self, snapshot_id: str) -> None:
+        try:
+            from koyeb.sandbox.snapshot import Snapshot
+        except Exception:
+            return
+        try:
+            Snapshot.get(
+                snapshot_id, api_token=self.config.api_token, host=self.config.api_host,
+            ).delete()
+        except Exception as exc:
+            logger.debug("Koyeb: could not delete previous snapshot %s: %s", snapshot_id, exc)
 
     # ── BaseEnvironment contract ──────────────────────────────────────────
 
@@ -183,7 +380,15 @@ class KoyebSandboxEnvironment(BaseEnvironment):
         from tools.environments.base_output import _ThreadedProcessHandle
         return _ThreadedProcessHandle(exec_fn, cancel_fn=cancel)
 
-    def cleanup(self):
+    def cleanup(self, force_remove: bool | None = None):
+        """Release the sandbox.
+
+        Persistent sessions snapshot then delete (Modal/Vercel: keep the
+        filesystem, stop the bill). ``force_remove`` skips the snapshot, which
+        is what the prompt-time probe asks for. Non-persistent sessions delete.
+        Idempotent. Failures are logged, not raised — cleanup runs from
+        ``finally`` blocks and from the idle reaper.
+        """
         if not hasattr(self, "_lock"):
             return
         with self._lock:
@@ -191,12 +396,27 @@ class KoyebSandboxEnvironment(BaseEnvironment):
                 return
             sandbox = self._sandbox
             self._closed = True
-            if self.persistent:
-                logger.info("Koyeb: keeping sandbox %s (persistent)", self.sandbox_name)
-                return
-            try:
-                sandbox.delete()
-                logger.info("Koyeb: deleted sandbox %s", self.sandbox_name)
-            except Exception as exc:
-                if not _sandbox_error_text(exc):
-                    logger.warning("Koyeb: cleanup failed: %s", exc)
+            if self._sync_manager is not None:
+                try:
+                    self._sync_manager.sync_back()
+                except Exception as exc:
+                    logger.warning("Koyeb: sync_back failed: %s", exc)
+            keep_filesystem = self.persistent and not force_remove
+            if keep_filesystem:
+                previous = _load_snapshot_id(self.task_id)
+                snapshot_id = self._snapshot_filesystem(sandbox)
+                if snapshot_id:
+                    try:
+                        _store_snapshot_id(self.task_id, snapshot_id)
+                        logger.info("Koyeb: saved filesystem snapshot %s for task %s",
+                                    snapshot_id, self.task_id)
+                    except Exception as exc:
+                        logger.warning("Koyeb: could not record snapshot id: %s", exc)
+                    if previous and previous != snapshot_id:
+                        self._delete_snapshot_object(previous)
+                else:
+                    logger.warning(
+                        "Koyeb: persistent sandbox %s will be deleted without a new snapshot",
+                        self.sandbox_name,
+                    )
+            self._delete_quiet(sandbox)

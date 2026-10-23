@@ -1,6 +1,11 @@
 name: hermes-koyeb-sandbox
-version: 0.1.0
-description: Run Hermes terminal commands in a Koyeb Sandbox container. Registers the "koyeb" terminal backend.
+version: 0.2.0
+description: >
+  Koyeb Sandbox terminal backend for Hermes Agent. With terminal.backend set
+  to koyeb, the terminal, file tools, and execute_code run in a Koyeb Sandbox
+  (same slot as docker, modal, daytona, vercel_sandbox, and singularity).
+  Enabling the plugin does not change terminal.backend and does not add a tool.
+provides_tools: []
 author: ThomsenDrake
 kind: backend
 requires_hermes: ">=0.21"
@@ -13,23 +18,25 @@ requires_env:
     description: "Koyeb API token (create at https://app.koyeb.com/account/api)"
     secret: true
 optional_env:
-  - name: KOYEB_SANDBOX_IMAGE
-    description: "Docker image for the sandbox (default koyeb/sandbox)"
-  - name: KOYEB_SANDBOX_REGION
-    description: "Koyeb region (default: SDK/account default)"
-  - name: KOYEB_SANDBOX_INSTANCE_TYPE
-    description: "micro | small | medium | large | xlarge (default micro)"
-  - name: KOYEB_SANDBOX_NAME_PREFIX
-    description: "Prefix for sandbox names (default hermes)"
-  - name: KOYEB_SANDBOX_TTL_SECONDS
-    description: "Auto-delete the sandbox after this many seconds (0 = never)"
-  - name: KOYEB_SANDBOX_IDLE_TIMEOUT_SECONDS
-    description: "Scale-to-zero idle timeout (0 = always-on)"
-  - name: KOYEB_SANDBOX_WAIT_READY_TIMEOUT_SECONDS
-    description: "Create/readiness timeout (default 300)"
-  - name: KOYEB_SANDBOX_REGISTRY_SECRET
-    description: "Koyeb secret with private-registry pull credentials"
-  - name: KOYEB_SANDBOX_BLOCK_NETWORK
-    description: "Set to true to block all sandbox egress"
+  - name: TERMINAL_KOYEB_IMAGE
+    description: "Image (terminal.koyeb_image wins). Legacy: KOYEB_SANDBOX_IMAGE. Default koyeb/sandbox"
+  - name: TERMINAL_KOYEB_REGION
+    description: "Koyeb region (terminal.koyeb_region wins). Legacy: KOYEB_SANDBOX_REGION"
+  - name: TERMINAL_KOYEB_INSTANCE_TYPE
+    description: "Named instance (terminal.koyeb_instance_type wins). Legacy: KOYEB_SANDBOX_INSTANCE_TYPE. Default micro when container_cpu/memory stay at the Hermes defaults"
+  - name: TERMINAL_KOYEB_NAME_PREFIX
+    description: "Sandbox name prefix (terminal.koyeb_name_prefix wins). Legacy: KOYEB_SANDBOX_NAME_PREFIX. Default hermes"
+  - name: TERMINAL_KOYEB_TTL_SECONDS
+    description: "delete_after_delay from creation (terminal.koyeb_ttl_seconds wins). Legacy: KOYEB_SANDBOX_TTL_SECONDS. 0 = off"
+  - name: TERMINAL_KOYEB_IDLE_TIMEOUT_SECONDS
+    description: "Scale-to-zero seconds (terminal.koyeb_idle_timeout_seconds wins). Legacy: KOYEB_SANDBOX_IDLE_TIMEOUT_SECONDS. Unset = 2x terminal.lifetime_seconds (at least 600). 0 = always-on"
+  - name: TERMINAL_KOYEB_DELETE_AFTER_INACTIVITY_SECONDS
+    description: "Delete after scale-to-zero (terminal.koyeb_delete_after_inactivity_seconds wins). Unset = 3600. 0 = off"
+  - name: TERMINAL_KOYEB_WAIT_READY_TIMEOUT_SECONDS
+    description: "Create/readiness timeout (terminal.koyeb_wait_ready_timeout_seconds wins). Legacy: KOYEB_SANDBOX_WAIT_READY_TIMEOUT_SECONDS. Default 300"
+  - name: TERMINAL_KOYEB_REGISTRY_SECRET
+    description: "Private-registry secret (terminal.koyeb_registry_secret wins). Legacy: KOYEB_SANDBOX_REGISTRY_SECRET"
+  - name: TERMINAL_KOYEB_BLOCK_NETWORK
+    description: "Block egress (terminal.koyeb_block_network wins). Legacy: KOYEB_SANDBOX_BLOCK_NETWORK. terminal.docker_network false also blocks"
   - name: KOYEB_API_HOST
-    description: "Koyeb API host override (default https://app.koyeb.com)"
+    description: "API host override (terminal.koyeb_api_host wins). Default https://app.koyeb.com"

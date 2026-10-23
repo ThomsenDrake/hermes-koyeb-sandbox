@@ -31,10 +31,24 @@ class CommandResult:
     command: str = ""
 
 
+class _RecordingFilesystem:
+    def upload_file(self, local_path, remote_path, encoding="utf-8"):
+        return None
+
+    def download_file(self, remote_path, local_path, encoding="utf-8"):
+        import tarfile
+        with tarfile.open(local_path, "w"):
+            pass
+
+    def write_file(self, path, content, encoding="utf-8"):
+        return None
+
+
 class _RecordingSandbox:
     def __init__(self, name="smoke"):
         self.name = name
         self.execs: list[str] = []
+        self.filesystem = _RecordingFilesystem()
 
     def exec(self, command, cwd=None, env=None, timeout=30, **kwargs):
         self.execs.append(command)
@@ -49,6 +63,10 @@ class _RecordingSandbox:
 
     def delete(self):
         self.execs.append("__delete__")
+
+    def snapshot(self, name, **kwargs):
+        self.execs.append("__snapshot__")
+        return type("Snap", (), {"id": "snap-smoke"})()
 
     @property
     def id(self):
