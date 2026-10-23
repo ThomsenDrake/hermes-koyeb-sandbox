@@ -177,10 +177,11 @@ def test_config_requires_token(monkeypatch):
 
 
 def test_config_defaults(monkeypatch):
-    monkeypatch.setenv("KOYEB_API_TOKEN", "t")
+    token = "koyeb-test-token-do-not-log"
+    monkeypatch.setenv("KOYEB_API_TOKEN", token)
     cfg = KoyebBackendConfig.from_env()
-    assert cfg.api_token == "t"
-    assert "t" not in repr(cfg)
+    assert cfg.api_token == token
+    assert token not in repr(cfg)
     assert cfg.image == "koyeb/sandbox"
     assert cfg.region is None          # SDK default (reads KOYEB_REGION itself)
     assert cfg.instance_type is None   # derived
@@ -604,7 +605,9 @@ def test_file_sync_uploads_before_execute(fake_koyeb, monkeypatch, tmp_path):
     cfg = KoyebBackendConfig.from_env()
     env = KoyebSandboxEnvironment(cfg, cwd="~", timeout=30, task_id="sync", persistent=False)
     try:
-        assert (str(host_file), remote) in env._sandbox.filesystem.uploads
+        # FileSyncManager copies into a temp dir, then uploads that copy.
+        # The remote path is the contract; the local path is the staging file.
+        assert remote in [dest for _, dest in env._sandbox.filesystem.uploads]
     finally:
         env._sync_manager.sync_back = lambda *a, **k: None
         env.cleanup()
