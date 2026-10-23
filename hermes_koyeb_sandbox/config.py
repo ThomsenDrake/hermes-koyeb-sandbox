@@ -24,9 +24,10 @@ SECRET_KEYS = frozenset({
     "AGENTS_SDK_KOYEB_SANDBOX_API_TOKEN",
 })
 
-# The Koyeb API rejects app/service names over 64 chars; the SDK derives the
-# app name from the sandbox name, so the sandbox name must fit that budget.
-_SANDBOX_NAME_MAX_LENGTH = 64
+# The Koyeb API rejects app/service names over 64 chars. The SDK derives the
+# app name as ``sandbox-app-{name}-{unix_seconds}`` (vendor spec.app_payload),
+# so the service name has to leave room for that prefix and a 10-digit stamp.
+_SANDBOX_NAME_MAX_LENGTH = 64 - len("sandbox-app-") - 1 - 10
 
 _DEFAULT_IMAGE = "koyeb/sandbox"
 
@@ -377,7 +378,10 @@ class KoyebBackendConfig:
         """Deterministic, bounded sandbox name for a task: <prefix>-<hash>.
 
         Hashed (not raw) so an arbitrary task_id can never blow past the Koyeb
-        64-char name limit or leak a profile path into a service name.
+        64-char name limit or leak a profile path into a service name. The
+        prefix is only ``name_prefix`` (default ``hermes``). A missing task
+        id, or one that is the placeholder ``unknown``, still hashes under
+        that prefix — it does not produce an ``unknown-`` service name.
         """
         digest = hashlib.sha256(str(task_id).encode()).hexdigest()[:24]
         name = f"{self.name_prefix}-{digest}"

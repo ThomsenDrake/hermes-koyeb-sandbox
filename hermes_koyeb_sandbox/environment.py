@@ -25,10 +25,13 @@ Command output truncation is not done here. Hermes truncates terminal and
 """
 from __future__ import annotations
 
+import base64
 import contextlib
+import io
 import logging
 import os
 import shlex
+import tarfile
 import threading
 import time
 from pathlib import Path
@@ -42,6 +45,22 @@ logger = logging.getLogger(__name__)
 _HOST_CWD_PREFIXES = ("/Users/", "/home/", "/opt/data/", "/mnt/", "/media/")
 _SNAPSHOT_STORE_NAME = "koyeb_snapshots.json"
 _FILESYSTEM_SNAPSHOT_TIMEOUT = 180
+
+
+def decode_sync_stdout(stdout: str) -> bytes:
+    """Turn a ``tar | base64`` stdout stream into archive bytes.
+
+    Whitespace (GNU ``base64`` wraps at 76 columns) is stripped. ``validate``
+    rejects a stream that has stderr, a shell marker, or a truncated chunk
+    mixed in — those used to surface later as ``tar: invalid header``.
+    """
+    compact = "".join((stdout or "").split())
+    if not compact:
+        raise RuntimeError("Koyeb sync_back stdout was empty")
+    try:
+        return base64.b64decode(compact, validate=True)
+    except Exception as exc:
+        raise RuntimeError("Koyeb sync_back stdout was not a base64 tar") from exc
 
 
 def _sanitize_cwd(cwd: str | None, home: str) -> str:
@@ -236,15 +255,12 @@ class KoyebSandboxEnvironment(BaseEnvironment):
         """
         try:
             from tools.environments.file_sync import (
-                FileSyncManager, iter_sync_files, quoted_mkdir_command, quoted_rm_command,
-                unique_parent_dirs,
+                FileSyncManager, iter_sync_files, quoted_rm_command,
             )
         except Exception:
             logger.debug("Koyeb: file sync unavailable", exc_info=True)
             return
-        self._quoted_mkdir = quoted_mkdir_command
         self._quoted_rm = quoted_rm_command
-        self._unique_parents = unique_parent_dirs
         remote_base = f"{self._home.rstrip('/')}/.hermes"
         self._sync_manager = FileSyncManager(
             get_files_fn=lambda: iter_sync_files(remote_base),
@@ -260,33 +276,63 @@ class KoyebSandboxEnvironment(BaseEnvironment):
     def _upload_one(self, host_path: str, remote_path: str) -> None:
         self._bulk_upload([(host_path, remote_path)])
 
+    def _exec_checked(self, command: str, *, timeout: int, label: str):
+        result = self._sandbox.exec(command, timeout=timeout)
+        if getattr(result, "exit_code", 1) != 0:
+            detail = (getattr(result, "stderr", None) or getattr(result, "stdout", None) or "").strip()
+            raise RuntimeError(f"Koyeb {label} failed (exit {result.exit_code}): {detail}")
+        return result
+
     def _bulk_upload(self, files: list[tuple[str, str]]) -> None:
+        """Install host files as real bytes, the way Modal pipes ``base64 -d | tar``.
+
+        The Koyeb file API stores the JSON string verbatim. The Python SDK's
+        ``encoding="base64"`` only base64-encodes that string on the client, so
+        the sandbox would see base64 text and a later sync_back would copy it
+        back over ``~/.hermes``. Write the archive as text, then decode it
+        inside the sandbox.
+        """
         if not files:
             return
-        parents = self._unique_parents(files)
-        if parents:
-            self._sandbox.exec(self._quoted_mkdir(parents), timeout=60)
-        fs = self._filesystem()
-        for host_path, remote_path in files:
-            # base64: credential files and skill trees are not all UTF-8.
-            fs.upload_file(host_path, remote_path, encoding="base64")
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            for host_path, remote_path in files:
+                tar.add(host_path, arcname=remote_path.lstrip("/"))
+        remote_b64 = f"/tmp/.hermes_push.{os.getpid()}.b64"
+        # Text, not encoding="base64": the executor must store the ASCII
+        # payload so ``base64 -d`` inside the sandbox recovers the tar.
+        self._filesystem().write_file(remote_b64, base64.b64encode(buf.getvalue()).decode("ascii"))
+        script = (
+            "set -o pipefail; "
+            f"base64 -d {shlex.quote(remote_b64)} | tar xf - -C /; "
+            "status=$?; "
+            f"rm -f {shlex.quote(remote_b64)}; "
+            "exit $status"
+        )
+        self._exec_checked(f"bash -c {shlex.quote(script)}", timeout=120, label="file sync upload")
 
     def _delete_remote(self, remote_paths: list[str]) -> None:
         if remote_paths:
             self._sandbox.exec(self._quoted_rm(remote_paths), timeout=30)
 
     def _bulk_download(self, dest: Path) -> None:
+        """Download ``~/.hermes`` the way Modal does: ``tar cf -`` as bytes.
+
+        Koyeb exec stdout is text, so the archive is base64 on stdout and
+        stderr stays on stderr. ``download_file(encoding="base64")`` cannot
+        do this: that flag client-decodes a file the executor returned as a
+        raw string, and ``tarfile`` then raises ``invalid header`` (retried
+        three times by FileSyncManager).
+        """
         rel = f"{self._home.rstrip('/')}/.hermes".lstrip("/")
-        remote_tar = f"/tmp/.hermes_sync.{os.getpid()}.tar"
-        self._sandbox.exec(
-            f"tar cf {shlex.quote(remote_tar)} --exclude='*.sock' -C / {shlex.quote(rel)}",
-            timeout=120,
+        script = (
+            "set -o pipefail; "
+            f"tar cf - --exclude='*.sock' -C / {shlex.quote(rel)} | base64"
         )
-        try:
-            self._filesystem().download_file(remote_tar, str(dest), encoding="base64")
-        finally:
-            with contextlib.suppress(Exception):
-                self._sandbox.exec(f"rm -f {shlex.quote(remote_tar)}", timeout=30)
+        result = self._exec_checked(
+            f"bash -c {shlex.quote(script)}", timeout=120, label="sync_back",
+        )
+        dest.write_bytes(decode_sync_stdout(result.stdout or ""))
 
     def _before_execute(self) -> None:
         if self._sync_manager is not None:

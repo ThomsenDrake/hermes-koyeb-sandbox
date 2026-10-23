@@ -230,6 +230,21 @@ def test_sandbox_name_short_and_stable(monkeypatch):
     assert cfg.sandbox_name("other") != n1
 
 
+@pytest.mark.parametrize("task_id", [None, "", "unknown", "unknown-session", "default"])
+def test_sandbox_name_never_uses_an_unknown_prefix(monkeypatch, task_id):
+    """A missing or placeholder task id is hashed. It is never the name prefix.
+
+    v0.1 and v0.2 both use ``<name_prefix>-<sha256>`` (default prefix
+    ``hermes``). Neither can mint a service named ``unknown-…``.
+    """
+    cfg = _make_config(monkeypatch)
+    name = cfg.sandbox_name(task_id)
+    assert name.startswith("hermes-")
+    assert not name.startswith("unknown")
+    # The SDK's app name is sandbox-app-<name>-<unix seconds> and must fit 64.
+    assert len(f"sandbox-app-{name}-{10**9}") <= 64
+
+
 # ── Environment execute path ────────────────────────────────────────────────
 
 def test_execute_runs_command_through_koyeb(fake_koyeb, monkeypatch, tmp_path):
@@ -592,7 +607,12 @@ def test_environment_returns_full_output_for_hermes_truncation(fake_koyeb, monke
         env.cleanup()
 
 
-def test_file_sync_uploads_before_execute(fake_koyeb, monkeypatch, tmp_path):
+def test_file_sync_uploads_real_bytes(fake_koyeb, monkeypatch, tmp_path):
+    """The file API stores strings verbatim. Upload must decode inside the sandbox."""
+    import base64
+    import io
+    import tarfile
+
     monkeypatch.setenv("KOYEB_API_TOKEN", "t")
     host_file = tmp_path / "token.txt"
     host_file.write_text("secret")
@@ -605,9 +625,86 @@ def test_file_sync_uploads_before_execute(fake_koyeb, monkeypatch, tmp_path):
     cfg = KoyebBackendConfig.from_env()
     env = KoyebSandboxEnvironment(cfg, cwd="~", timeout=30, task_id="sync", persistent=False)
     try:
-        # FileSyncManager copies into a temp dir, then uploads that copy.
-        # The remote path is the contract; the local path is the staging file.
-        assert remote in [dest for _, dest in env._sandbox.filesystem.uploads]
+        assert env._sandbox.filesystem.uploads == []
+        written = [payload for path, payload in env._sandbox.filesystem.writes if str(path).endswith(".b64")]
+        assert written
+        archive = base64.b64decode(written[-1] if isinstance(written[-1], str) else written[-1].decode())
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            member = tar.extractfile(remote.lstrip("/")).read()
+        assert member == b"secret"
+        assert any(
+            "base64 -d" in call["command"] and "tar xf" in call["command"]
+            for call in env._sandbox.calls
+        )
+    finally:
+        env._sync_manager.sync_back = lambda *a, **k: None
+        env.cleanup()
+
+
+def test_sync_back_uses_stdout_base64_not_file_api(fake_koyeb, monkeypatch, tmp_path):
+    """Live failure: sync_back retried 3 times with tar 'invalid header'.
+
+    ``download_file(encoding='base64')`` base64-decodes the file-API string.
+    A ``tar cf`` archive is raw bytes, so that decode is not a tar. Modal
+    streams ``tar cf -``; Koyeb's stdout is text, so the archive is base64
+    on stdout and stderr stays off the stream.
+    """
+    import base64
+    import io
+    import tarfile
+
+    monkeypatch.setenv("KOYEB_API_TOKEN", "t")
+    host_file = tmp_path / "note.txt"
+    host_file.write_text("original")
+    remote = "/root/.hermes/note.txt"
+    monkeypatch.setattr(
+        "tools.environments.file_sync.iter_sync_files",
+        lambda *args, **kwargs: [(str(host_file), remote)],
+    )
+    from hermes_koyeb_sandbox.environment import KoyebSandboxEnvironment, decode_sync_stdout
+    cfg = KoyebBackendConfig.from_env()
+    env = KoyebSandboxEnvironment(cfg, cwd="~", timeout=30, task_id="syncback", persistent=False)
+
+    payload = b"Hello from the sandbox. " * 200
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(remote.lstrip("/"))
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+    raw_tar = buf.getvalue()
+
+    # The old path: the executor hands the raw archive back as a string and
+    # the SDK base64-decodes it. tarfile reports invalid header.
+    garbage = base64.b64decode(raw_tar.decode("latin-1"))
+    with pytest.raises(tarfile.ReadError, match="invalid header"):
+        tarfile.open(fileobj=io.BytesIO(garbage))
+
+    wrapped = base64.b64encode(raw_tar).decode("ascii")
+    wrapped = "\n".join(wrapped[i:i + 76] for i in range(0, len(wrapped), 76)) + "\n"
+    stderr = "tar: ./root/.hermes/note.txt: file changed as we read it\n"
+    # stderr mixed into the base64 stream is not a tar. Stdout alone is.
+    with pytest.raises(RuntimeError, match="not a base64 tar"):
+        decode_sync_stdout(wrapped + stderr)
+    assert tarfile.open(fileobj=io.BytesIO(decode_sync_stdout(wrapped)))
+
+    calls = env._sandbox.calls
+
+    def exec_download(command, cwd=None, env=None, timeout=30, **kwargs):
+        calls.append({"command": command, "timeout": timeout})
+        assert "2>&1" not in command
+        assert "tar cf -" in command and "| base64" in command
+        return FakeCommandResult(stdout=wrapped, stderr=stderr, exit_code=0)
+
+    env._sandbox.exec = exec_download
+
+    def download_file(*_args, **_kwargs):
+        raise AssertionError("sync_back must not download the tar through the file API")
+
+    env._sandbox.filesystem.download_file = download_file
+    try:
+        env._sync_manager.sync_back()
+        assert host_file.read_bytes() == payload
+        assert b"file changed" not in host_file.read_bytes()
     finally:
         env._sync_manager.sync_back = lambda *a, **k: None
         env.cleanup()
